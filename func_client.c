@@ -36,11 +36,15 @@
 #include <linux/syscalls.h>
 #include <linux/slab.h>
 #include <crypto/aes.h>
+#include <linux/fs.h>   
+#include <asm/uaccess.h>   
+#include <linux/mm.h>  
+#include <linux/string.h>  
 #include "checksum.h"
 #include "authclient.h"
 #include "encrypt2.h"
 #include "AES.h"
-
+#include "fileops.h"
 
 
 MODULE_LICENSE("GPL");
@@ -49,12 +53,6 @@ MODULE_LICENSE("GPL");
 #define AUTH	0
 #define AES	1
 #define CHECKSUM	0
-#define ENCRYPT_WORKMODE 0
-#define ENCRYPT_MODE 0x00
-#define ENCRYPT_ALG 0x00
-#define CHECKSUM_WORKMODE 0
-#define CHECKSUM_MODE 0x00
-#define CHECKSUM_ALG 0x00
 
 /*
  * The devices
@@ -107,6 +105,20 @@ struct ecb_aes_ctx aes_ecb_ctx;
 struct ecb_des_ctx des_ecb_ctx;
 unsigned char ecb_aes_key[16] = { 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f };
 unsigned char ecb_des_key[16] = { 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07 };
+
+//参数控制
+int ENCRYPT_WORKMODE = 0;
+int ENCRYPT_MODE = 0;
+int ENCRYPT_ALG = 0;
+int CHECKSUM_WORKMODE = 0;
+int CHECKSUM_MODE = 0;
+int CHECKSUM_ALG = 0;
+static int encrypt_number = 3;   
+int encrypt[3] = {0,0,0};
+module_param_array(encrypt, int, &encrypt_number, 0664);
+int checksum[3] = {0,0,0};
+static int checksum_number = 3;  
+module_param_array(checksum, int, &checksum_number, 0664);
 
 //该函数向内核协议栈发送控制信息，通知其开启指定网络设备的数据传输通道，从而开始协议栈向该网络设备发送数据报。
 int vni_open(struct net_device* dev)
@@ -165,6 +177,13 @@ netdev_tx_t vni_tx(struct sk_buff* skb, struct net_device* dev)
 	struct sk_buff* skb2;
 	struct net_device* ens_dev;
 
+	ENCRYPT_WORKMODE = encrypt[0];
+	ENCRYPT_MODE = encrypt[1];
+	ENCRYPT_ALG = encrypt[2];
+	CHECKSUM_WORKMODE = checksum[0];
+	CHECKSUM_MODE = checksum[1];
+	CHECKSUM_ALG = checksum[2];
+
 	ens_dev = dev_get_by_name(&init_net, "ens33");
 
 	if (skb_headroom(skb) < (2 + sizeof(struct vnihdr))) {
@@ -179,12 +198,27 @@ netdev_tx_t vni_tx(struct sk_buff* skb, struct net_device* dev)
 		skb = skb2;
 	}
 
+
+
 	eth = (struct ethhdr*)skb->data;
 	memcpy(pre_ethhdr.h_source, eth->h_source, ETH_ALEN);
 	memcpy(pre_ethhdr.h_dest, eth->h_dest, ETH_ALEN);
 	pre_ethhdr.h_proto = eth->h_proto;
 	skb_pull(skb,sizeof(struct ethhdr));
 
+	//这部分获取网络层的源ip地址
+	printk(KERN_INFO "tx:type:0x%04X\n", ntohs(eth->h_proto));
+	if(ntohs(eth->h_proto) == 0x0800){
+		printk(KERN_INFO "i need get ip!\n");
+		struct iphdr *iphdr = ip_hdr(skb);
+		printk("src_ip:%ld\n", ntohl(iphdr->saddr));
+		if(judgment_ip(ntohl(iphdr->saddr)) != 1){
+			printk(KERN_INFO "not match drop!\n");
+			kfree_skb(skb);
+			return NET_RX_DROP;
+		}
+	}
+	//
 	p = skb_push(skb, sizeof(struct vnihdr));
 	vni = (struct vnihdr*)p;
 	vni->enc_mode = ENCRYPT_MODE;
@@ -387,6 +421,13 @@ int vni_rx(struct sk_buff* skb, struct net_device* dev,
 	struct net_device* ens_dev;
 	unsigned char MAC[ETH_ALEN] = {0x00, 0x50, 0x56, 0x32, 0x12, 0xb0};
 
+	ENCRYPT_WORKMODE = encrypt[0];
+	ENCRYPT_MODE = encrypt[1];
+	ENCRYPT_ALG = encrypt[2];
+	CHECKSUM_WORKMODE = checksum[0];
+	CHECKSUM_MODE = checksum[1];
+	CHECKSUM_ALG = checksum[2];
+
 	ens_dev = dev_get_by_name(&init_net, "ens33");
 	vni_dev = dev_get_by_name(&init_net,"vni0");
 	printk(KERN_INFO "rx: get one packet from dev:%s\n", skb->dev->name);
@@ -485,21 +526,24 @@ int vni_rx(struct sk_buff* skb, struct net_device* dev,
 	else {
 		printk(KERN_INFO "No CHECKSUM\n");
 	}
-	//这里没问题
-	printk(KERN_INFO "AEC ok!\n");
-	//ens33上交的包也丢了
-	/*
-	if (strcmp(skb->dev->name, "ens33") == 0) {
-		printk(KERN_INFO "rec drop!\n");
-		kfree_skb(skb);
-		return NET_RX_DROP;
-	}*/
+
 	//printk(KERN_INFO "dev:%s recv one packet, ID: %d%d%d%d, sequence:%d, type:0x%04X\n", skb->dev->name, vni->number1, vni->number2, vni->number3, vni->number4, ntohs(vni->sequence), ntohs(vni->type));
-	sb->protocol = vni->type; //这句有问题
+	sb->protocol = vni->type; 
 	p = skb_pull(sb, sizeof(struct vnihdr));
 
 	skb_reset_network_header(sb);
-
+	//获取ip报文的ip地址
+	printk(KERN_INFO "rx:type:0x%04X\n", ntohs(sb->protocol));
+	if(ntohs(sb->protocol) == 0x0800){
+		printk(KERN_INFO "i need get ip!\n");
+		struct iphdr *iphdr = ip_hdr(skb);
+		printk("src_ip:%ld\n", ntohl(iphdr->saddr));
+		if(judgment_ip(ntohl(iphdr->saddr)) != 1){
+			printk(KERN_INFO "not match drop!\n");
+			kfree_skb(skb);
+			return NET_RX_DROP;
+		}
+	}
 
 	vni_data.pkt_rx_num++;
 	vni_dev->stats.rx_packets++;
@@ -529,8 +573,19 @@ static void timer_function(struct timer_list  *timer)
 {
 
 	struct vni_priv_data* data = from_timer(data, timer, funTimer);
-	printk(KERN_INFO "send:packet_tx_total=%dpackets,pps=%d/1000 p/s\n", data->pkt_tx_num, (data->pkt_tx_num - data->pkt_tx_prenum) * 1000 / 60);
-	printk(KERN_INFO "recv:packet_rx_total=%dpackets,pps=%d/1000 p/s\n", data->pkt_rx_num, (data->pkt_rx_num - data->pkt_rx_prenum) * 1000 / 60);
+	//测试文件读取
+	//judgment_ip(0);
+	//写流量
+	char txbuf[256];
+	char rxbuf[256];
+	memset(txbuf,0,sizeof(txbuf));
+	memset(rxbuf,0,sizeof(rxbuf));
+	sprintf(txbuf,"send:packet_tx_total=%dpackets,pps=%d/1000 p/s\n", data->pkt_tx_num, (data->pkt_tx_num - data->pkt_tx_prenum) * 1000 / 60);
+	sprintf(rxbuf,"recv:packet_rx_total=%dpackets,pps=%d/1000 p/s\n", data->pkt_rx_num, (data->pkt_rx_num - data->pkt_rx_prenum) * 1000 / 60);
+	flow_count(txbuf,rxbuf);
+	//
+	printk(KERN_INFO "%s",txbuf);
+	printk(KERN_INFO "%s",rxbuf);
 	data->pkt_tx_prenum = data->pkt_tx_num;
 	data->pkt_rx_prenum = data->pkt_rx_num;
 	mod_timer(&data->funTimer, jiffies + 60 * HZ);
@@ -608,6 +663,13 @@ int vni_init_module(void)
 	unsigned char MAC[ETH_ALEN] = {0x00, 0x50, 0x56, 0x32, 0x12, 0xb0};
 	struct net_device* ens_dev;
 
+	ENCRYPT_WORKMODE = encrypt[0];
+	ENCRYPT_MODE = encrypt[1];
+	ENCRYPT_ALG = encrypt[2];
+	CHECKSUM_WORKMODE = checksum[0];
+	CHECKSUM_MODE = checksum[1];
+	CHECKSUM_ALG = checksum[2];
+	
 	ens_dev = dev_get_by_name(&init_net, "ens33");
 	vni_dev = alloc_netdev(sizeof(struct vni_priv), "vni%d", NET_NAME_ENUM, vni_init);
 	if (vni_dev == NULL)
@@ -634,12 +696,19 @@ int vni_init_module(void)
 	if (AUTH == 1) {
 		send_hello(MAC, ens_dev);
 	}
+	judgment_ip(0);
+	flow_count("test","01:");
+	// judgment_ip(0);
+	// judgment_ip(0);
+	printk(KERN_INFO "encrypt_wokemode: %d, encrypt_mode: %d, encrypt_alg: %d \n", ENCRYPT_WORKMODE,ENCRYPT_MODE,ENCRYPT_ALG);
+    printk(KERN_INFO "checksum_wokemode: %d, checksum_mode: %d, checksum_alg: %d \n", CHECKSUM_WORKMODE,CHECKSUM_MODE,CHECKSUM_ALG);
 
 out:
 	if (ret)
 		vni_cleanup();
 	return ret;
 }
+
 
 module_init(vni_init_module);
 module_exit(vni_cleanup);
